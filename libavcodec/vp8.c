@@ -2578,6 +2578,9 @@ int vp78_decode_frame(AVCodecContext *avctx, void *data, int *got_frame,
         s->pix_fmt = AV_PIX_FMT_YUV420P;
     } else if (!is_vp7 && s->pix_fmt == AV_PIX_FMT_NONE) {
         enum AVPixelFormat pix_fmts[] = {
+#if CONFIG_VP8_VAAPI_HWACCEL
+            AV_PIX_FMT_VAAPI,
+#endif
             AV_PIX_FMT_YUV420P,
             AV_PIX_FMT_NONE,
         };
