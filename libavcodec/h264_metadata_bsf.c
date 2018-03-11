@@ -24,6 +24,7 @@
 #include "bsf.h"
 #include "cbs.h"
 #include "cbs_h264.h"
+#include "cbs_misc.h"
 #include "h264.h"
 #include "h264_sei.h"
 
@@ -74,6 +75,8 @@ typedef struct H264MetadataContext {
     int display_orientation;
     double rotate;
     int flip;
+
+    int a53_cc;
 } H264MetadataContext;
 
 
@@ -223,6 +226,8 @@ static int h264_metadata_filter(AVBSFContext *bsf, AVPacket *out)
     H264RawAUD aud;
     uint8_t *displaymatrix_side_data = NULL;
     size_t displaymatrix_side_data_size = 0;
+    uint8_t *a53_side_data = NULL;
+    size_t a53_side_data_size = 0;
 
     err = ff_bsf_get_packet(bsf, &in);
     if (err < 0)
@@ -515,6 +520,116 @@ static int h264_metadata_filter(AVBSFContext *bsf, AVPacket *out)
         }
     }
 
+    if (ctx->a53_cc == INSERT) {
+        uint8_t *data;
+        int size;
+
+        data = av_packet_get_side_data(in, AV_PKT_DATA_A53_CC, &size);
+        if (data) {
+            A53UserData a53_ud;
+
+            err = ff_cbs_read_a53_cc_side_data(ctx->cbc, &a53_ud,
+                                               data, size);
+            if (err < 0) {
+                av_log(bsf, AV_LOG_WARNING, "Invalid A/53 closed captions "
+                       "in packet side data dropped.\n");
+            } else {
+                H264RawSEIPayload payload = {
+                    .payload_type = H264_SEI_TYPE_USER_DATA_REGISTERED,
+                };
+                H264RawSEIUserDataRegistered *udr =
+                    &payload.payload.user_data_registered;
+                size_t size = 9 + 3 * a53_ud.atsc.cc_data.cc_count;
+
+                udr->data_ref = av_buffer_alloc(2 + size);
+                if (!udr->data_ref) {
+                    err = AVERROR(ENOMEM);
+                    goto fail;
+                }
+                udr->data = udr->data_ref->data;
+
+                udr->itu_t_t35_country_code = 181;
+                AV_WB16(udr->data, 49); // provider_code
+
+                err = ff_cbs_write_a53_user_data(ctx->cbc, udr->data + 2,
+                                                 &size, &a53_ud);
+                if (err < 0) {
+                    av_log(bsf, AV_LOG_ERROR, "Failed to write "
+                           "A/53 user data.\n");
+                    av_buffer_unref(&udr->data_ref);
+                    goto fail;
+                }
+                udr->data_length = size + 2;
+
+                err = ff_cbs_h264_add_sei_message(ctx->cbc, au, &payload);
+                if (err < 0) {
+                    av_log(bsf, AV_LOG_ERROR, "Failed to add A/53 user data "
+                           "SEI message to access unit.\n");
+                    av_buffer_unref(&udr->data_ref);
+                    goto fail;
+                }
+            }
+        }
+
+    } else if (ctx->a53_cc == REMOVE || ctx->a53_cc == EXTRACT) {
+        for (i = 0; i < au->nb_units; i++) {
+            H264RawSEI *sei;
+            if (au->units[i].type != H264_NAL_SEI)
+                continue;
+            sei = au->units[i].content;
+
+            for (j = 0; j < sei->payload_count; j++) {
+                H264RawSEIUserDataRegistered *udr;
+                A53UserData a53_ud;
+
+                if (sei->payload[j].payload_type !=
+                    H264_SEI_TYPE_USER_DATA_REGISTERED)
+                    continue;
+                udr = &sei->payload[j].payload.user_data_registered;
+                if (udr->data_length < 6) {
+                    // Can't be relevant.
+                    continue;
+                }
+
+                err = ff_cbs_read_a53_user_data(ctx->cbc, &a53_ud,
+                                                udr->data + 2,
+                                                udr->data_length - 2);
+                if (err < 0) {
+                    // Invalid or something completely different.
+                    continue;
+                }
+                if (a53_ud.user_identifier != A53_USER_IDENTIFIER_ATSC ||
+                    a53_ud.atsc.user_data_type_code !=
+                        A53_USER_DATA_TYPE_CODE_CC_DATA) {
+                    // Valid but something else (e.g. AFD).
+                    continue;
+                }
+
+                if (ctx->a53_cc == REMOVE) {
+                    err = ff_cbs_h264_delete_sei_message(ctx->cbc, au,
+                                                         &au->units[i], j);
+                    if (err < 0) {
+                        av_log(bsf, AV_LOG_ERROR, "Failed to delete "
+                               "A/53 CC SEI message.\n");
+                        goto fail;
+                    }
+                    --i;
+                    break;
+                } else if(ctx->a53_cc == EXTRACT) {
+                    err = ff_cbs_write_a53_cc_side_data(ctx->cbc,
+                                                        &a53_side_data,
+                                                        &a53_side_data_size,
+                                                        &a53_ud);
+                    if (err < 0) {
+                        av_log(bsf, AV_LOG_ERROR, "Failed to write "
+                               "A/53 user data for packet side data.\n");
+                        goto fail;
+                    }
+                }
+            }
+        }
+    }
+
     err = ff_cbs_write_packet(ctx->cbc, out, au);
     if (err < 0) {
         av_log(bsf, AV_LOG_ERROR, "Failed to write packet.\n");
@@ -536,6 +651,16 @@ static int h264_metadata_filter(AVBSFContext *bsf, AVPacket *out)
         }
         displaymatrix_side_data = NULL;
     }
+    if (a53_side_data) {
+        err = av_packet_add_side_data(out, AV_PKT_DATA_A53_CC,
+                                      a53_side_data, a53_side_data_size);
+        if (err) {
+            av_log(bsf, AV_LOG_ERROR, "Failed to attach extracted A/53 "
+                   "side data to packet.\n");
+            goto fail;
+        }
+        a53_side_data = NULL;
+    }
 
     ctx->done_first_au = 1;
 
@@ -543,6 +668,7 @@ static int h264_metadata_filter(AVBSFContext *bsf, AVPacket *out)
 fail:
     ff_cbs_fragment_uninit(ctx->cbc, au);
     av_freep(&displaymatrix_side_data);
+    av_freep(&a53_side_data);
 
     if (err < 0)
         av_packet_unref(out);
@@ -682,6 +808,18 @@ static const AVOption h264_metadata_options[] = {
     { "vertical",   "Set ver_flip",
         0, AV_OPT_TYPE_CONST,
         { .i64 = FLIP_VERTICAL },   .flags = FLAGS, .unit = "flip" },
+
+    { "a53_cc", "A/53 Closed Captions in SEI NAL units",
+        OFFSET(a53_cc), AV_OPT_TYPE_INT,
+        { .i64 = PASS }, PASS, EXTRACT, FLAGS, "a53_cc" },
+    { "pass",    NULL, 0, AV_OPT_TYPE_CONST,
+        { .i64 = PASS    }, .flags = FLAGS, .unit = "a53_cc" },
+    { "insert",  NULL, 0, AV_OPT_TYPE_CONST,
+        { .i64 = INSERT  }, .flags = FLAGS, .unit = "a53_cc" },
+    { "remove",  NULL, 0, AV_OPT_TYPE_CONST,
+        { .i64 = REMOVE  }, .flags = FLAGS, .unit = "a53_cc" },
+    { "extract", NULL, 0, AV_OPT_TYPE_CONST,
+        { .i64 = EXTRACT }, .flags = FLAGS, .unit = "a53_cc" },
 
     { NULL }
 };
