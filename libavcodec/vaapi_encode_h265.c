@@ -56,6 +56,9 @@ typedef struct VAAPIEncodeH265Context {
     VAAPIEncodeContext common;
 
     // Encoder features.
+    int      va_features_available;
+    uint32_t va_features;
+    uint32_t va_block_sizes;
     uint32_t ctu_size;
     uint32_t min_cb_size;
 
@@ -273,6 +276,15 @@ static int vaapi_encode_h265_init_sequence_params(AVCodecContext *avctx)
     int chroma_format, bit_depth;
     int i;
 
+#if VA_CHECK_VERSION(1, 10, 0)
+    VAConfigAttribValEncHEVCFeatures features = {
+        .value = priv->va_features,
+    };
+    VAConfigAttribValEncHEVCBlockSizes block_sizes = {
+        .value = priv->va_block_sizes,
+    };
+#endif
+
     memset(vps, 0, sizeof(*vps));
     memset(sps, 0, sizeof(*sps));
     memset(pps, 0, sizeof(*pps));
@@ -439,25 +451,73 @@ static int vaapi_encode_h265_init_sequence_params(AVCodecContext *avctx)
             vps->vps_max_latency_increase_plus1[i];
     }
 
-    // These have to come from the capabilities of the encoder.  We have no
-    // way to query them, so just hardcode parameters which work on the Intel
-    // driver.
-    // CTB size from 8x8 to 32x32.
-    sps->log2_min_luma_coding_block_size_minus3   = 0;
-    sps->log2_diff_max_min_luma_coding_block_size = 2;
-    // Transform size from 4x4 to 32x32.
-    sps->log2_min_luma_transform_block_size_minus2   = 0;
-    sps->log2_diff_max_min_luma_transform_block_size = 3;
-    // Full transform hierarchy allowed (2-5).
-    sps->max_transform_hierarchy_depth_inter = 3;
-    sps->max_transform_hierarchy_depth_intra = 3;
-    // AMP works.
-    sps->amp_enabled_flag = 1;
-    // SAO and temporal MVP do not work.
-    sps->sample_adaptive_offset_enabled_flag = 0;
-    sps->sps_temporal_mvp_enabled_flag       = 0;
+#if VA_CHECK_VERSION(1, 10, 0)
+    if (priv->va_features_available) {
+        sps->log2_min_luma_coding_block_size_minus3 =
+            ff_ctz(priv->min_cb_size) - 3;
+        sps->log2_diff_max_min_luma_coding_block_size =
+            ff_ctz(priv->ctu_size) - ff_ctz(priv->min_cb_size);
 
-    sps->pcm_enabled_flag = 0;
+        sps->log2_min_luma_transform_block_size_minus2 =
+            block_sizes.bits.log2_min_luma_transform_block_size_minus2;
+        sps->log2_diff_max_min_luma_transform_block_size =
+            block_sizes.bits.log2_max_luma_transform_block_size_minus2 -
+            block_sizes.bits.log2_min_luma_transform_block_size_minus2;
+
+        sps->max_transform_hierarchy_depth_inter =
+            block_sizes.bits.max_max_transform_hierarchy_depth_inter;
+        sps->max_transform_hierarchy_depth_intra =
+            block_sizes.bits.max_max_transform_hierarchy_depth_intra;
+
+        // These features are generally worth always enabling if supported.
+        // Other features may be available, but not necessarily desirable so
+        // would need some additional decision.
+        sps->amp_enabled_flag =
+            VAAPI_ENCODE_FEATURE_FLAG(features.bits.amp, 1);
+        sps->sample_adaptive_offset_enabled_flag =
+            VAAPI_ENCODE_FEATURE_FLAG(features.bits.sao, 1);
+        sps->sps_temporal_mvp_enabled_flag =
+            VAAPI_ENCODE_FEATURE_FLAG(features.bits.temporal_mvp, 1);
+
+        // These features may not always be desirable, but we enable them
+        // if the driver requires them.
+        sps->pcm_enabled_flag =
+            VAAPI_ENCODE_FEATURE_FLAG(features.bits.pcm, 0);
+        sps->strong_intra_smoothing_enabled_flag =
+            VAAPI_ENCODE_FEATURE_FLAG(features.bits.strong_intra_smoothing, 0);
+
+        if (sps->pcm_enabled_flag) {
+            sps->pcm_sample_bit_depth_luma_minus1   = bit_depth - 1;
+            sps->pcm_sample_bit_depth_chroma_minus1 = bit_depth - 1;
+            sps->log2_min_pcm_luma_coding_block_size_minus3 =
+                block_sizes.bits.log2_min_pcm_coding_block_size_minus3;
+            sps->log2_diff_max_min_pcm_luma_coding_block_size =
+                block_sizes.bits.log2_max_pcm_coding_block_size_minus3 -
+                block_sizes.bits.log2_min_pcm_coding_block_size_minus3;
+        }
+    } else
+#endif
+    {
+        // These values come from the capabilities of the first encoder
+        // implementation in the i965 driver on Intel Skylake.  They may
+        // fail badly with other platforms or drivers.
+        // CTB size from 8x8 to 32x32.
+        sps->log2_min_luma_coding_block_size_minus3   = 0;
+        sps->log2_diff_max_min_luma_coding_block_size = 2;
+        // Transform size from 4x4 to 32x32.
+        sps->log2_min_luma_transform_block_size_minus2   = 0;
+        sps->log2_diff_max_min_luma_transform_block_size = 3;
+        // Full transform hierarchy allowed (2-5).
+        sps->max_transform_hierarchy_depth_inter = 3;
+        sps->max_transform_hierarchy_depth_intra = 3;
+        // AMP works.
+        sps->amp_enabled_flag = 1;
+        // SAO and temporal MVP do not work.
+        sps->sample_adaptive_offset_enabled_flag = 0;
+        sps->sps_temporal_mvp_enabled_flag       = 0;
+        // PCM blocks are not enabled.
+        sps->pcm_enabled_flag = 0;
+    }
 
     // STRPSs should ideally be here rather than defined individually in
     // each slice, but the structure isn't completely fixed so for now
@@ -548,8 +608,38 @@ static int vaapi_encode_h265_init_sequence_params(AVCodecContext *avctx)
 
     pps->init_qp_minus26 = priv->fixed_qp_idr - 26;
 
-    pps->cu_qp_delta_enabled_flag = (ctx->va_rc_mode != VA_RC_CQP);
-    pps->diff_cu_qp_delta_depth   = 0;
+#if VA_CHECK_VERSION(1, 10, 0)
+    if (priv->va_features_available) {
+        // Enable CU QP delta if supported in non-CQP mode, or
+        // unconditionally if the driver requires it.
+        pps->cu_qp_delta_enabled_flag =
+            VAAPI_ENCODE_FEATURE_FLAG(features.bits.cu_qp_delta,
+                                      ctx->va_rc_mode != VA_RC_CQP);
+        if (pps->cu_qp_delta_enabled_flag) {
+            pps->diff_cu_qp_delta_depth =
+                block_sizes.bits.log2_min_luma_coding_block_size_minus3 -
+                block_sizes.bits.log2_min_cu_qp_delta_size_minus3;
+        }
+
+        // These features may be desirable in some cases, but we don't want
+        // to enable them unconditionally.
+        pps->sign_data_hiding_enabled_flag =
+            VAAPI_ENCODE_FEATURE_FLAG(features.bits.sign_data_hiding,       0);
+        pps->constrained_intra_pred_flag =
+            VAAPI_ENCODE_FEATURE_FLAG(features.bits.constrained_intra_pred, 0);
+        pps->transform_skip_enabled_flag =
+            VAAPI_ENCODE_FEATURE_FLAG(features.bits.transform_skip,         0);
+        pps->transquant_bypass_enabled_flag =
+            VAAPI_ENCODE_FEATURE_FLAG(features.bits.transquant_bypass,      0);
+
+    } else
+#endif
+    {
+        // If we can't query features then assume CU QP delta is allowed
+        // for non-CQP modes.
+        pps->cu_qp_delta_enabled_flag = (ctx->va_rc_mode != VA_RC_CQP);
+        pps->diff_cu_qp_delta_depth   = 0;
+    }
 
     if (ctx->tile_rows && ctx->tile_cols) {
         int uniform_spacing;
@@ -1102,7 +1192,43 @@ static av_cold void vaapi_encode_h265_block_size(AVCodecContext *avctx)
     VAAPIEncodeContext      *ctx = avctx->priv_data;
     VAAPIEncodeH265Context *priv = avctx->priv_data;
 
+#if VA_CHECK_VERSION(1, 10, 0)
+    {
+        VAConfigAttrib attr[] = {
+            { .type = VAConfigAttribEncHEVCFeatures   },
+            { .type = VAConfigAttribEncHEVCBlockSizes },
+        };
+        VAConfigAttribValEncHEVCBlockSizes block_sizes;
+        VAStatus vas;
+
+        vas = vaGetConfigAttributes(ctx->hwctx->display,
+                                    ctx->va_profile, ctx->va_entrypoint,
+                                    attr, FF_ARRAY_ELEMS(attr));
+        if (vas != VA_STATUS_SUCCESS) {
+            av_log(avctx, AV_LOG_WARNING, "Failed to query encoder "
+                   "features, using guessed defaults.\n");
+        } else if (attr[0].value == VA_ATTRIB_NOT_SUPPORTED ||
+                   attr[1].value == VA_ATTRIB_NOT_SUPPORTED) {
+            av_log(avctx, AV_LOG_WARNING, "Driver does not advertise "
+                   "encoder features, using guessed defaults.\n");
+        } else {
+            priv->va_features_available = 1;
+            priv->va_features    = attr[0].value;
+            priv->va_block_sizes = attr[1].value;
+
+            block_sizes.value = priv->va_block_sizes;
+
+            priv->ctu_size =
+                1 << block_sizes.bits.log2_max_coding_tree_block_size_minus3 + 3;
+            priv->min_cb_size =
+                1 << block_sizes.bits.log2_min_luma_coding_block_size_minus3 + 3;
+        }
+    }
+#endif
+
     if (!priv->ctu_size) {
+        // Guess the default values from the first implementation if we
+        // can't query the driver to find a proper answer.
         priv->ctu_size     = 32;
         priv->min_cb_size  = 16;
     }

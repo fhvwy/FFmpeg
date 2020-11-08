@@ -481,4 +481,10 @@ int ff_vaapi_encode_close(AVCodecContext *avctx);
     VAAPI_ENCODE_RC_MODE(AVBR, "Average variable-bitrate")
 
 
+// Set a feature flag based on driver feature support.
+#define VAAPI_ENCODE_FEATURE_FLAG(driver_support, desired_value) \
+    ((driver_support) == VA_FEATURE_SUPPORTED ? (desired_value) : \
+     (driver_support) == VA_FEATURE_REQUIRED  ? 1 : 0)
+
+
 #endif /* AVCODEC_VAAPI_ENCODE_H */
